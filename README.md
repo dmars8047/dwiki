@@ -18,7 +18,7 @@ This will search for the term "nasa" on Wikipedia and print a summary of the fir
 
 ### Adding to your Code
 ```
-go get github.com/dmars8047/dwiki/cmd/dwiki@latest
+go get github.com/dmars8047/dwiki/pkg/dwiki@latest
 ```
 
 ### Example usage
