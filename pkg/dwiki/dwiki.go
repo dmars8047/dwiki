@@ -16,11 +16,14 @@ This will search for the term "golang" on Wikipedia and print a summary of the f
 package dwiki
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 )
 
@@ -35,14 +38,30 @@ type searchResponse struct {
 			Totalhits int `json:"totalhits"`
 		} `json:"searchinfo"`
 		Search []struct {
-			Ns        int    `json:"ns"`
-			Title     string `json:"title"`
-			Pageid    int    `json:"pageid"`
-			Size      int    `json:"size"`
-			Wordcount int    `json:"wordcount"`
-			Snippet   string `json:"snippet"`
-			Timestamp string `json:"timestamp"`
+			Ns              int    `json:"ns"`
+			Title           string `json:"title"`
+			Pageid          int    `json:"pageid"`
+			Wordcount       int    `json:"wordcount"`
+			CategorySnippet string `json:"categorysnippet"`
 		} `json:"search"`
+	} `json:"query"`
+}
+
+type categoryResponse struct {
+	Batchcomplete string `json:"batchcomplete"`
+	Query         struct {
+		Pages map[string]struct {
+			Pageid     int    `json:"pageid"`
+			Ns         int    `json:"ns"`
+			Title      string `json:"title"`
+			Categories []struct {
+				Ns    int    `json:"ns"`
+				Title string `json:"title"`
+			} `json:"categories,omitempty"`
+			PageProps *struct {
+				Disambiguation string `json:"disambiguation,omitempty"`
+			} `json:"pageprops,omitempty"`
+		} `json:"pages"`
 	} `json:"query"`
 }
 
@@ -58,6 +77,7 @@ type extractResponse struct {
 			Ns      int    `json:"ns"`
 			Title   string `json:"title"`
 			Extract string `json:"extract"`
+			FullURL string `json:"fullurl"`
 		} `json:"pages"`
 	} `json:"query"`
 	Limits struct {
@@ -65,9 +85,12 @@ type extractResponse struct {
 	} `json:"limits"`
 }
 
-func GetWikiArticleSummary(topic string, writer io.Writer) error {
-
+// GetMatchingArticles searches for articles matching the given topic and writes the results to the given writer.
+// It returns a map of article titles with their corresponding index.
+func GetMatchingArticles(topic string, writer io.Writer) (map[int]int, error) {
 	const url = "https://en.wikipedia.org/w/api.php"
+
+	options := make(map[int]int)
 
 	params := make(map[string]string)
 
@@ -75,6 +98,8 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 	params["list"] = "search"
 	params["srsearch"] = topic
 	params["format"] = "json"
+	params["srlimit"] = "20"
+	params["srprop"] = "wordcount|categorysnippet"
 
 	// Call the API
 	httpClient := http.Client{}
@@ -82,7 +107,7 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 	req, err := http.NewRequest("GET", url, nil)
 
 	if err != nil {
-		return err
+		return options, err
 	}
 
 	q := req.URL.Query()
@@ -96,7 +121,7 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 	resp, err := httpClient.Do(req)
 
 	if err != nil {
-		return err
+		return options, err
 	}
 
 	defer resp.Body.Close()
@@ -105,7 +130,7 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 	responseBytes, err := io.ReadAll(resp.Body)
 
 	if err != nil {
-		return err
+		return options, err
 	}
 
 	var searchResponse searchResponse
@@ -113,31 +138,111 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 	err = json.Unmarshal(responseBytes, &searchResponse)
 
 	if err != nil {
-		return err
+		return options, err
 	}
 
 	// If there are no search results, print a message
 	if len(searchResponse.Query.Search) == 0 {
-		return errors.New("no search results found")
+		writer.Write([]byte("No search results found.\n\n"))
+		return options, nil
 	}
 
-	// Get the title of the first search result
-	pgIdStr := fmt.Sprintf("%d", searchResponse.Query.Search[0].Pageid)
+	// Get the categories for the search results to eliminate disambiguation pages
+	categoryQueryUrl := "https://en.wikipedia.org/w/api.php?action=query&prop=pageprops&ppprop=disambiguation&redirects&format=json&pageids="
 
-	title := searchResponse.Query.Search[0].Title
+	for _, result := range searchResponse.Query.Search {
+		categoryQueryUrl += fmt.Sprintf("%d|", result.Pageid)
+	}
 
-	// Replace spaces with underscores
-	title = strings.Replace(title, " ", "_", -1)
+	// Get rid of the last pipe character
+	categoryQueryUrl = categoryQueryUrl[:len(categoryQueryUrl)-1]
 
-	explainUrl := fmt.Sprintf("https://en.wikipedia.org/w/api.php?format=json&action=query&prop=extracts&exlimit=max&explaintext&exintro&titles=%s", title)
+	req, err = http.NewRequest("GET", categoryQueryUrl, nil)
 
-	req, err = http.NewRequest("GET", explainUrl, nil)
+	if err != nil {
+		return options, err
+	}
+
+	resp, err = httpClient.Do(req)
+
+	if err != nil {
+		return options, err
+	}
+
+	defer resp.Body.Close()
+
+	responseBytes, err = io.ReadAll(resp.Body)
+
+	if err != nil {
+		return options, err
+	}
+
+	var categoryResponse categoryResponse
+
+	err = json.Unmarshal(responseBytes, &categoryResponse)
+
+	if err != nil {
+		return options, err
+	}
+
+	// Print the titles of the search results
+	resultString := "Search results:\n"
+
+	num := 1
+
+	for _, result := range searchResponse.Query.Search {
+		// Check if the article is a disambiguation page
+		isDisambiguation := false
+
+		categoryPage, ok := categoryResponse.Query.Pages[strconv.Itoa(result.Pageid)]
+
+		if !ok {
+			continue
+		}
+
+		if categoryPage.PageProps != nil {
+			isDisambiguation = categoryPage.PageProps.Disambiguation == ""
+		}
+
+		if isDisambiguation {
+			continue
+		}
+
+		resultString += fmt.Sprintf("%d. %s\n", num, result.Title)
+		options[num] = result.Pageid
+		num++
+
+		if num > 10 {
+			break
+		}
+	}
+
+	if num < 1 {
+		writer.Write([]byte("No valid search results found\n"))
+		return options, nil
+	}
+
+	_, err = writer.Write([]byte(resultString))
+
+	if err != nil {
+		return make(map[int]int), err
+	}
+
+	return options, nil
+}
+
+func GetArticleSummary(pageId int, writer io.Writer) error {
+	explainUrl := fmt.Sprintf("https://en.wikipedia.org/w/api.php?format=json&action=query&prop=info|extracts&exlimit=max&explaintext&exintro&pageids=%d&inprop=url", pageId)
+
+	httpClient := http.Client{}
+
+	req, err := http.NewRequest("GET", explainUrl, nil)
 
 	if err != nil {
 		return err
 	}
 
-	resp, err = httpClient.Do(req)
+	resp, err := httpClient.Do(req)
 
 	if err != nil {
 		return err
@@ -145,7 +250,7 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 
 	defer resp.Body.Close()
 
-	responseBytes, err = io.ReadAll(resp.Body)
+	responseBytes, err := io.ReadAll(resp.Body)
 
 	if err != nil {
 		return err
@@ -159,9 +264,19 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 		return err
 	}
 
+	// Get the page ID
+	var pgIdStr string
+
+	for key := range extractResponse.Query.Pages {
+		pgIdStr = key
+		break
+	}
+
 	if extractResponse.Query.Pages[pgIdStr].Extract == "" {
 		return errors.New("no extract found")
 	}
+
+	articleUrl := extractResponse.Query.Pages[pgIdStr].FullURL
 
 	extract := extractResponse.Query.Pages[pgIdStr].Extract
 
@@ -170,17 +285,68 @@ func GetWikiArticleSummary(topic string, writer io.Writer) error {
 	paragraphs := strings.Split(extract, "\n")
 
 	// Get the first paragraph
-	firstParagraph := paragraphs[0]
+	summary := paragraphs[0]
 
 	// If the first paragraph is longer than 1024 characters, truncate it
-	if len(firstParagraph) > 1024 {
-		firstParagraph = firstParagraph[:1024] + "..."
+	if len(summary) > 1024 {
+		summary = strings.TrimSpace(summary[:1024]) + "..."
+	} else {
+		// If there is a second paragraph, add it
+		if len(paragraphs) > 1 {
+			summary += "\n\n" + paragraphs[1]
+
+			if len(summary) > 1024 {
+				summary = strings.TrimSpace(summary[:1024]) + "..."
+			}
+		}
 	}
 
 	// Add the find out more link
-	firstParagraph += fmt.Sprintf("\n\nFind out more: https://en.wikipedia.org/wiki/%s", title)
+	summary += fmt.Sprintf("\n\nFind out more: %s", articleUrl)
 
-	io.WriteString(writer, firstParagraph)
+	io.WriteString(writer, summary)
+
+	return nil
+}
+
+// GetWikiArticleSummary searches for the given topic on Wikipedia and writes a summary of the first search result to the given writer.
+func GetWikiArticleSummary(topic string, writer io.Writer) error {
+	options, err := GetMatchingArticles(topic, writer)
+
+	if err != nil {
+		return err
+	}
+
+	if len(options) == 0 {
+		return errors.New("no search results found")
+	}
+
+	// Get the user's choice
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("Enter the number of the article you want to read: ")
+	choice, _ := reader.ReadString('\n')
+
+	choice = strings.TrimSpace(choice)
+
+	choiceInt := 0
+
+	// Convert the choice to an integer
+	if choice == "" {
+		return errors.New("you must enter a valid number")
+	}
+
+	choiceInt, err = strconv.Atoi(choice)
+
+	if err != nil {
+		return errors.New("you must enter a valid number")
+	}
+
+	// Get the article summary
+	err = GetArticleSummary(options[choiceInt], writer)
+
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
